@@ -4,67 +4,68 @@ This skill automates the post-release bug review: classifies each bug with the *
 
 **The agentic automation insight:** Most of this work is mechanical (pulling bugs, classifying against a rubric, building docs, splitting by confidence), but the PM's mapping judgment must stay human. The pipeline is "agentic" because the orchestrator (`run_review.py`) chains deterministic tools together and **stops at decision points** where human judgment matters:
 
+```mermaid
+flowchart TD
+    START(["run_review.py --version 1.2.6.0 --prev-versions 1.2.5.0,1.2.4.0"])
+    START --> PRE{"preflight<br/>token · claude CLI · site reachable?"}
+    PRE -->|"missing"| EXIT["exit with setup instructions<br/>nothing written"]
+
+    PRE -->|"ok"| PULL["1 · pull_bugs.py + pull_features.py<br/><i>current + prior releases</i>"]
+    PULL --> D1[("bugs_&lt;v&gt;.json<br/>features_&lt;v&gt;.json")]
+
+    D1 --> CLS["2 · classify_headless.py<br/><i>shells out to</i> claude -p"]
+    RUBRIC[/"classification_rubric.md<br/>SKILL.md steps 2-3<br/>feature PRDs"/] --> CLS
+    CLS --> D2[("analysis_&lt;v&gt;.json<br/><i>RCA type · confidence · match basis</i>")]
+    D2 --> VAL{"validate_schema<br/>every bug well-formed?"}
+    VAL -->|"no"| EXIT
+
+    VAL -->|"yes"| BUILD["3 · build_deliverables.py"]
+    BUILD --> D3[("Bug_Review_&lt;v&gt;_Analysis.md<br/>Bug_Review_&lt;v&gt;_Rollup.xlsx<br/>plan_&lt;v&gt;.json")]
+
+    D3 --> SPLIT{"4 · split_plan.py<br/>which actions are <i>facts</i>?"}
+    SPLIT -->|"confidence == high<br/>AND match basis == linked_issues"| AUTO[("plan.auto.json")]
+    SPLIT -->|"medium/low confidence<br/>PRD-content match<br/>PM Analysis text"| REVIEW[("plan.review.json")]
+
+    AUTO --> DRY["5 · write_back.py --dry-run<br/><i>prints every change, writes nothing</i>"]
+    DRY -->|"--dry-run-only"| STOPOK["stop — read-only smoke test"]
+    DRY --> CANARY{"6 · canary: --limit 5<br/>any failures?"}
+    CANARY -->|"yes"| ABORT["abort before full apply<br/>only 5 issues touched"]
+    CANARY -->|"no"| FULL["7 · full apply<br/><i>idempotent: skips set RCA + existing links</i>"]
+    FULL --> JIRA[("Jira")]
+    FULL --> VERIFY{"8 · verify — re-fetch every bug<br/>does Jira match the plan?"}
+    JIRA -.->|"re-read"| VERIFY
+    VERIFY -->|"mismatch"| FLAG["flagged in NEEDS_REVIEW"]
+
+    VERIFY --> NR["9 · needs_review.py"]
+    REVIEW --> NR
+    FLAG --> NR
+    NR --> NRDOC[("NEEDS_REVIEW_&lt;v&gt;.md")]
+
+    NRDOC --> HUMAN{{"HUMAN GATE — the PM decides<br/>Is each medium-confidence RCA call right?<br/>Are the PRD-content feature links right?"}}
+    HUMAN -->|"edit plan.review.json,<br/>then run the same ladder by hand"| MANUAL["write_back.py --allow-review-tier<br/><i>flag required; run_review.py never passes it</i>"]
+    MANUAL --> JIRA
+
+    LEDGER[("runs.jsonl + logs/<br/><i>local audit trail</i>")]
+    NR -.->|"one line per run"| LEDGER
+
+    classDef tool fill:#dbeafe,stroke:#1e40af,color:#0b1a3a
+    classDef llm fill:#ede9fe,stroke:#5b21b6,color:#1e1035
+    classDef data fill:#f1f5f9,stroke:#475569,color:#0f172a
+    classDef gate fill:#fef3c7,stroke:#b45309,color:#3b2503
+    classDef human fill:#dcfce7,stroke:#15803d,color:#052e16
+    classDef stop fill:#fee2e2,stroke:#b91c1c,color:#450a0a
+
+    class PULL,BUILD,DRY,FULL,NR,MANUAL tool
+    class CLS,RUBRIC llm
+    class D1,D2,D3,AUTO,REVIEW,NRDOC,JIRA,LEDGER data
+    class PRE,VAL,SPLIT,CANARY,VERIFY gate
+    class HUMAN human
+    class EXIT,ABORT,STOPOK,FLAG stop
 ```
-        ┌─────────────────────────────────────────────────────────────┐
-        │  run_review.py — THE ORCHESTRATOR                           │
-        └─────────────────────────────────────────────────────────────┘
-                                    │
-        ┌───────────────────────────┴───────────────────────────────┐
-        │  MECHANICAL TOOLS (deterministic, automated)               │
-        ├───────────────────────────────────────────────────────────┤
-        │                                                             │
-        │  1. pull_bugs.py + pull_features.py                        │
-        │     └→ JIRA data (JSON)                                    │
-        │                                                             │
-        │  2. classify_headless.py (claude -p)                       │
-        │     └→ read rubric + bugs + PRD                            │
-        │     └→ assign RCA Type + confidence level                  │
-        │     └→ analysis_<version>.json                             │
-        │                                                             │
-        │  3. build_deliverables.py                                  │
-        │     └→ doc + xlsx + full plan_<version>.json              │
-        │                                                             │
-        │  4. split_plan.py                                          │
-        │     └→ auto-tier: high-confidence + linked_issues only     │
-        │     └→ review-tier: everything else                        │
-        │                                                             │
-        │  5. write_back.py (dry-run)                                │
-        │     └→ preview: "here's what would change"                 │
-        │                                                             │
-        ├───────────────────────────────────────────────────────────┤
-        │  SAFETY GATE 1: Dry-run completes successfully?            │
-        ├───────────────────────────────────────────────────────────┤
-        │                                                             │
-        │  6. write_back.py (canary + full apply)                    │
-        │     └→ auto-tier ONLY — no human judgment needed           │
-        │     └→ high-confidence RCA values are safe to write        │
-        │     └→ linked_issues feature links are facts, not guesses  │
-        │                                                             │
-        │  7. write_back.py (verify)                                 │
-        │     └→ re-fetch from Jira, confirm changes landed          │
-        │                                                             │
-        │  8. needs_review.py                                        │
-        │     └→ NEEDS_REVIEW_<version>.md                          │
-        │                                                             │
-        └───────────────────────────────────────────────────────────┘
-                                    │
-        ┌───────────────────────────┴───────────────────────────────┐
-        │  HUMAN JUDGMENT GATE                                       │
-        ├───────────────────────────────────────────────────────────┤
-        │                                                             │
-        │  You read NEEDS_REVIEW and decide:                         │
-        │  • Is each medium-confidence RCA call correct?             │
-        │  • Are the PRD-content feature links right?                │
-        │  • Should any review-tier bugs get different handling?     │
-        │                                                             │
-        │  Then you apply the review tier yourself:                  │
-        │  python3 write_back.py --plan plan_*.review.json \         │
-        │                         --allow-review-tier ...            │
-        │                                                             │
-        │  (--allow-review-tier flag REQUIRED; code enforces this)   │
-        │                                                             │
-        └───────────────────────────────────────────────────────────┘
-```
+
+Reading the colors: **blue** = deterministic tools, **purple** = the one LLM step, **grey** = files on disk, **amber** = gates the code enforces, **green** = the human decision, **red** = a stop.
+
+The load-bearing idea is the amber `split_plan.py` gate. An LLM classified every bug, but only two kinds of action are allowed through without a person: an RCA value the rubric itself calls `high` confidence, and a feature link that was **already an explicit link in Jira** — a fact read out of the bug's own data, never the model's inference from reading a PRD. Everything else routes to the human gate, and `write_back.py` refuses a `tier: "review"` plan unless a person types `--allow-review-tier`. The orchestrator's own source never contains that flag, so "the PM confirms before write-back" is a property of the code, not a convention someone has to remember.
 
 **Why this is "agentic"**: The orchestrator chains independent tools intelligently, collecting facts along the way (bugs, features, rubric match results), and uses those facts to make deterministic decisions (confidence-based tier split, feature matching based on existing links). It never skips a decision—it just pushes judgment calls to the human at the right moment. Each tool is a "capability" the agent uses; the orchestrator is the "reasoning loop" that decides which tools to run and when to pause.
 
